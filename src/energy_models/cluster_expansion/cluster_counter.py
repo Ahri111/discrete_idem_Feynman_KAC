@@ -6,10 +6,9 @@ by matching local environments to reference clusters.
 """
 
 import numpy as np
-from .structure_utils import posreader, dismatcreate, create_atom_type_mapping
-from .reference_generator import load_reference_clusters
-from .symmetry import get_canonical_form
-
+from src.energy_models.cluster_expansion.structure_utils import posreader, dismatcreate, create_atom_type_mapping
+from src.energy_models.cluster_expansion.reference_generator import load_reference_clusters
+from src.energy_models.cluster_expansion.symmetry import get_canonical_form
 
 def find_positioned_neighbors(core_idx, poscar, atom_types, atom_ind_group):
     """

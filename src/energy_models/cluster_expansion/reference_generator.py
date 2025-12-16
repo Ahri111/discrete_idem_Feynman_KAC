@@ -8,7 +8,7 @@ compositional constraints and symmetry equivalence.
 
 import json
 from itertools import product
-from .symmetry import get_canonical_form
+from src.energy_models.cluster_expansion.symmetry import get_canonical_form
 
 
 def generate_reference_clusters(atom_ind_group):
