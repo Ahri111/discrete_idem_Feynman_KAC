@@ -156,27 +156,181 @@ class EnergyCalculator:
         return energy
 
 
+    def _compute_dismat_numpy(self, positions_np, lattice_np):
+        """
+        Compute distance matrix from numpy arrays (no POSCAR dict).
+
+        Args:
+            positions_np: [N, 3] numpy array of fractional coordinates
+            lattice_np: [3, 3] numpy array of lattice vectors
+
+        Returns:
+            dismat: [N, N] numpy array of distances
+        """
+        N = positions_np.shape[0]
+        dismat = np.zeros((N, N))
+
+        for i in range(N):
+            for j in range(N):
+                # Fractional coordinate difference
+                delta = positions_np[i] - positions_np[j]
+
+                # Apply minimum image convention (PBC)
+                delta = np.where(delta > 0.5, delta - 1, delta)
+                delta = np.where(delta <= -0.5, delta + 1, delta)
+                delta = np.abs(delta)
+
+                # Convert to Cartesian and compute distance
+                cart_delta = np.dot(delta, lattice_np)
+                dismat[i, j] = np.linalg.norm(cart_delta)
+
+        return dismat
+
+
+    def _find_positioned_neighbors_numpy(self, core_idx, positions_np, dismat, atom_types, atom_ind_group):
+        """
+        Find positioned neighbors from numpy arrays (no POSCAR dict).
+
+        Args:
+            core_idx: Index of core B-site atom
+            positions_np: [N, 3] numpy array of fractional coordinates
+            dismat: [N, N] numpy array of distances
+            atom_types: List/array of atom type indices
+            atom_ind_group: [[A_types], [B_types], [O_types]]
+
+        Returns:
+            positioned_neighbors: Dict with 'b_positions', 'o_positions', 'a_positions'
+        """
+        distances = dismat[core_idx]
+        core_pos = positions_np[core_idx]
+
+        # Distance ranges (Angstroms)
+        b_range = (3.8, 4.2)
+        o_range = (1.8, 2.2)
+        a_range = (3.0, 4.0)
+
+        positioned_neighbors = {
+            'b_positions': [None] * 6,
+            'o_positions': [None] * 6,
+            'a_positions': [None] * 8
+        }
+
+        candidates = {'b': [], 'o': [], 'a': []}
+
+        for i, dist in enumerate(distances):
+            if i == core_idx:
+                continue
+
+            atom_type = atom_types[i]
+
+            # Direction vector with PBC
+            vec = positions_np[i] - core_pos
+            vec = np.where(vec > 0.5, vec - 1, vec)
+            vec = np.where(vec <= -0.5, vec + 1, vec)
+
+            # Classify by type and distance
+            if atom_type in atom_ind_group[1] and b_range[0] <= dist <= b_range[1]:
+                candidates['b'].append((atom_type, vec))
+            elif atom_type in atom_ind_group[2] and o_range[0] <= dist <= o_range[1]:
+                candidates['o'].append((atom_type, vec))
+            elif len(atom_ind_group) > 0 and atom_type in atom_ind_group[0] and a_range[0] <= dist <= a_range[1]:
+                candidates['a'].append((atom_type, vec))
+
+        # Import assignment functions
+        from src.energy_models.cluster_expansion.cluster_counter import assign_b_o_direction, assign_a_direction
+
+        # Assign to directional positions
+        for cand in candidates['b'][:6]:
+            assign_b_o_direction(cand, positioned_neighbors['b_positions'])
+
+        for cand in candidates['o'][:6]:
+            assign_b_o_direction(cand, positioned_neighbors['o_positions'])
+
+        for cand in candidates['a'][:8]:
+            assign_a_direction(cand, positioned_neighbors['a_positions'])
+
+        return positioned_neighbors
+
+
+    def _count_clusters_from_arrays(self, atom_types, positions_np, dismat):
+        """
+        Count clusters from numpy arrays (no POSCAR dict).
+
+        Args:
+            atom_types: [N] list/array of atom type indices
+            positions_np: [N, 3] numpy array of fractional coordinates
+            dismat: [N, N] numpy array of distances
+
+        Returns:
+            cluster_list: [B_count, O_count, cluster1_count, ..., clusterN_count]
+        """
+        # Convert to list if array
+        if isinstance(atom_types, np.ndarray):
+            atom_types = atom_types.tolist()
+
+        b_site_indices = [i for i, t in enumerate(atom_types) if t in self.atom_ind_group[1]]
+
+        # Initialize cluster counts
+        cluster_counts = [0] * len(self.reference_clusters)
+
+        # Count clusters at each B-site
+        for b_idx in b_site_indices:
+            # Compute cluster
+            core_type = atom_types[b_idx]
+            positioned_neighbors = self._find_positioned_neighbors_numpy(
+                b_idx, positions_np, dismat, atom_types, self.atom_ind_group
+            )
+            cluster = generate_single_positioned_cluster(core_type, positioned_neighbors)
+
+            if cluster is None:
+                continue
+
+            canonical = get_canonical_form(tuple(cluster))
+
+            # Lookup in reference (O(1))
+            ref_idx = self.cluster_to_idx.get(canonical, None)
+            if ref_idx is not None:
+                cluster_counts[ref_idx] += 1
+
+        # Prepend B-site and O-site total counts
+        b_count = sum(1 for t in atom_types if t in self.atom_ind_group[1])
+        o_count = sum(1 for t in atom_types if t in self.atom_ind_group[2])
+
+        result = [b_count, o_count] + cluster_counts
+
+        return result
+
+
     def compute_energy_from_tensor(self, positions, atom_types, lattice, metadata=None):
         """
         Compute energy from PyTorch tensors (for diffusion model).
+
+        Optimized: Tensor → numpy → dismat → cluster → energy
+        (No POSCAR dict conversion)
 
         Args:
             positions: [N, 3] tensor of fractional coordinates
             atom_types: [N] tensor of type indices
             lattice: [3, 3] tensor of lattice vectors
-            metadata: Optional metadata dict
+            metadata: Optional metadata dict (unused but kept for compatibility)
 
         Returns:
             energy: Predicted energy (float)
         """
-        # Convert to POSCAR
-        poscar = self.converter.tensor_to_poscar(positions, atom_types, lattice, metadata)
+        # Convert tensors to numpy
+        positions_np = positions.cpu().numpy() if hasattr(positions, 'cpu') else np.array(positions)
+        atom_types_np = atom_types.cpu().numpy() if hasattr(atom_types, 'cpu') else np.array(atom_types)
+        lattice_np = lattice.cpu().numpy() if hasattr(lattice, 'cpu') else np.array(lattice)
 
-        # Add distance matrix
-        poscar = dismatcreate(poscar)
+        # Compute distance matrix
+        dismat = self._compute_dismat_numpy(positions_np, lattice_np)
 
-        # Compute energy
-        energy = self.compute_energy(poscar)
+        # Count clusters
+        cluster_list = self._count_clusters_from_arrays(atom_types_np, positions_np, dismat)
+
+        # Scale and predict
+        cluster_scaled = self.scaler.transform([cluster_list])[0]
+        energy = self.model.predict([cluster_scaled])[0]
 
         return energy
 
@@ -186,28 +340,53 @@ class EnergyCalculator:
         """
         Compute energies from batched tensors (for diffusion model).
 
+        Optimized: Tensor → numpy → dismat → cluster → energy
+        (No POSCAR dict conversion)
+
         Args:
             positions: [B, N, 3] tensor
             atom_types: [B, N] tensor
             lattice: [3, 3] or [B, 3, 3] tensor
-            metadata: Optional list of metadata dicts
+            metadata: Optional list of metadata dicts (unused)
             n_workers: Number of parallel workers
 
         Returns:
             energies: [B] numpy array of energies
         """
-        # Convert to POSCAR list
-        poscar_list = self.converter.batch_tensor_to_poscar(
-            positions, atom_types, lattice, metadata
-        )
+        # Convert tensors to numpy
+        positions_np = positions.cpu().numpy() if hasattr(positions, 'cpu') else np.array(positions)
+        atom_types_np = atom_types.cpu().numpy() if hasattr(atom_types, 'cpu') else np.array(atom_types)
+        lattice_np = lattice.cpu().numpy() if hasattr(lattice, 'cpu') else np.array(lattice)
 
-        # Add distance matrices
-        poscar_list = [dismatcreate(p) for p in poscar_list]
+        batch_size = positions_np.shape[0]
 
-        # Batch compute
-        energies = self.compute_energy_batch(poscar_list, n_workers=n_workers)
+        # Handle single lattice for all structures
+        if lattice_np.ndim == 2:
+            lattice_np = np.expand_dims(lattice_np, axis=0).repeat(batch_size, axis=0)
 
-        return energies
+        # Parallel processing
+        def process_single(idx):
+            pos = positions_np[idx]
+            types = atom_types_np[idx]
+            lat = lattice_np[idx]
+
+            # Compute distance matrix
+            dismat = self._compute_dismat_numpy(pos, lat)
+
+            # Count clusters
+            cluster_list = self._count_clusters_from_arrays(types, pos, dismat)
+
+            # Scale and predict
+            cluster_scaled = self.scaler.transform([cluster_list])[0]
+            energy = self.model.predict([cluster_scaled])[0]
+
+            return energy
+
+        # Parallel compute
+        with Pool(n_workers) as pool:
+            energies = pool.map(process_single, range(batch_size))
+
+        return np.array(energies)
 
 
     def _count_clusters_from_poscar(self, poscar, use_cache=False, structure_id=None):
