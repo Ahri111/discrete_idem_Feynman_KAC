@@ -20,6 +20,7 @@ from src.energy_models.cluster_expansion.cluster_counter import (
 )
 from src.energy_models.cluster_expansion.reference_generator import load_reference_clusters
 from src.energy_models.cluster_expansion.symmetry import get_canonical_form
+from src.energy_models.cluster_expansion.structure_converter import StructureConverter
 
 
 class EnergyCalculator:
@@ -40,7 +41,8 @@ class EnergyCalculator:
                        e.g., [[0, 2], [1, 3], [4, 5]]
     """
 
-    def __init__(self, model_file, scaler_file, cluster_file, atom_ind_group):
+    def __init__(self, model_file, scaler_file, cluster_file, atom_ind_group,
+                 element_names=None, template_file=None):
         # Load LASSO model
         with open(model_file, "rb") as f:
             self.model = pickle.load(f)
@@ -61,6 +63,12 @@ class EnergyCalculator:
 
         # Cache for incremental updates
         self._cluster_cache = {}  # {structure_id: {b_idx: cluster}}
+
+        # Structure converter for tensor support
+        self.converter = StructureConverter(
+            element_names=element_names,
+            template_file=template_file
+        )
 
         print(f"[EnergyCalculator] Loaded model with {len(self.reference_clusters)} reference clusters")
         print(f"[EnergyCalculator] LASSO features: {np.count_nonzero(self.model.coef_)}")
@@ -146,6 +154,60 @@ class EnergyCalculator:
         energy = self.model.predict([cluster_scaled])[0]
 
         return energy
+
+
+    def compute_energy_from_tensor(self, positions, atom_types, lattice, metadata=None):
+        """
+        Compute energy from PyTorch tensors (for diffusion model).
+
+        Args:
+            positions: [N, 3] tensor of fractional coordinates
+            atom_types: [N] tensor of type indices
+            lattice: [3, 3] tensor of lattice vectors
+            metadata: Optional metadata dict
+
+        Returns:
+            energy: Predicted energy (float)
+        """
+        # Convert to POSCAR
+        poscar = self.converter.tensor_to_poscar(positions, atom_types, lattice, metadata)
+
+        # Add distance matrix
+        poscar = dismatcreate(poscar)
+
+        # Compute energy
+        energy = self.compute_energy(poscar)
+
+        return energy
+
+
+    def compute_energy_batch_from_tensor(self, positions, atom_types, lattice,
+                                         metadata=None, n_workers=8):
+        """
+        Compute energies from batched tensors (for diffusion model).
+
+        Args:
+            positions: [B, N, 3] tensor
+            atom_types: [B, N] tensor
+            lattice: [3, 3] or [B, 3, 3] tensor
+            metadata: Optional list of metadata dicts
+            n_workers: Number of parallel workers
+
+        Returns:
+            energies: [B] numpy array of energies
+        """
+        # Convert to POSCAR list
+        poscar_list = self.converter.batch_tensor_to_poscar(
+            positions, atom_types, lattice, metadata
+        )
+
+        # Add distance matrices
+        poscar_list = [dismatcreate(p) for p in poscar_list]
+
+        # Batch compute
+        energies = self.compute_energy_batch(poscar_list, n_workers=n_workers)
+
+        return energies
 
 
     def _count_clusters_from_poscar(self, poscar, use_cache=False, structure_id=None):
@@ -300,12 +362,17 @@ class EnergyCalculator:
         return result
 
 
-def create_energy_calculator(base_dir='src/energy_models/cluster_expansion/energy_parameter'):
+def create_energy_calculator(base_dir='src/energy_models/cluster_expansion/energy_parameter',
+                            atom_ind_group=None, element_names=None):
     """
     Convenience function to create EnergyCalculator.
 
     Args:
         base_dir: Directory containing model files
+        atom_ind_group: Optional custom atom groups
+                       Default: [[0], [1], [2]] for pure SrTiO3
+        element_names: Optional element names for tensor conversion
+                      Default: ['Sr', 'Ti', 'O']
 
     Returns:
         calculator: Configured EnergyCalculator instance
@@ -315,20 +382,26 @@ def create_energy_calculator(base_dir='src/energy_models/cluster_expansion/energ
     model_file = os.path.join(base_dir, 'trained_lasso_model.pkl')
     scaler_file = os.path.join(base_dir, 'trained_lasso_scaler.pkl')
     cluster_file = os.path.join(base_dir, 'reference_clusters.json')
+    template_file = os.path.join(base_dir, 'POSCAR_ABO3')
 
-    # Default atom_ind_group for Sr-Ti-Fe-O-VO system
-    # Adjust based on your POSCAR structure
-    atom_ind_group = [
-        [0, 2],  # A-site: Sr(0), La(2) - adjust as needed
-        [1, 3],  # B-site: Ti(1), Fe(3) - adjust as needed
-        [4, 5]   # O-site: O(4), VO(5) - adjust as needed
-    ]
+    # Default for pure SrTiO3
+    if atom_ind_group is None:
+        atom_ind_group = [
+            [0],  # A-site: Sr
+            [1],  # B-site: Ti
+            [2]   # O-site: O
+        ]
+
+    if element_names is None:
+        element_names = ['Sr', 'Ti', 'O']
 
     calculator = EnergyCalculator(
         model_file=model_file,
         scaler_file=scaler_file,
         cluster_file=cluster_file,
-        atom_ind_group=atom_ind_group
+        atom_ind_group=atom_ind_group,
+        element_names=element_names,
+        template_file=template_file
     )
 
     return calculator
