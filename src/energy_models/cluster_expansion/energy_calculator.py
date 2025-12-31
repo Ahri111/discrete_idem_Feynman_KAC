@@ -263,11 +263,11 @@ class EnergyCalculator:
             if ref_idx is not None:
                 cluster_counts[ref_idx] += 1
 
-        # Prepend Ti and O counts
-        ti_count = sum(1 for t in atom_types if t == 1)
-        o_count = sum(1 for t in atom_types if t == 3)
+        # Prepend B-site and O-site total counts
+        b_count = sum(1 for t in atom_types if t in self.atom_ind_group[1])
+        o_count = sum(1 for t in atom_types if t in self.atom_ind_group[2])
 
-        result = [ti_count, o_count] + cluster_counts
+        result = [b_count, o_count] + cluster_counts
 
         return result
 
@@ -353,11 +353,11 @@ class EnergyCalculator:
             if ref_idx is not None:
                 cluster_counts[ref_idx] += 1
 
-        # Prepend Ti and O counts (unchanged by swap)
-        ti_count = sum(1 for t in atom_types if t == 1)
-        o_count = sum(1 for t in atom_types if t == 3)
+        # Prepend B-site and O-site counts (unchanged by swap within same site)
+        b_count = sum(1 for t in atom_types if t in self.atom_ind_group[1])
+        o_count = sum(1 for t in atom_types if t in self.atom_ind_group[2])
 
-        result = [ti_count, o_count] + cluster_counts
+        result = [b_count, o_count] + cluster_counts
 
         return result
 
@@ -370,9 +370,9 @@ def create_energy_calculator(base_dir='src/energy_models/cluster_expansion/energ
     Args:
         base_dir: Directory containing model files
         atom_ind_group: Optional custom atom groups
-                       Default: [[0], [1], [2]] for pure SrTiO3
+                       Default: [[0], [1, 2], [3, 4]] for Sr-Ti/Fe-O/VO system
         element_names: Optional element names for tensor conversion
-                      Default: ['Sr', 'Ti', 'O']
+                      Default: ['Sr', 'Ti', 'Fe', 'O', 'VO']
 
     Returns:
         calculator: Configured EnergyCalculator instance
@@ -384,16 +384,16 @@ def create_energy_calculator(base_dir='src/energy_models/cluster_expansion/energ
     cluster_file = os.path.join(base_dir, 'reference_clusters.json')
     template_file = os.path.join(base_dir, 'POSCAR_ABO3')
 
-    # Default for pure SrTiO3
+    # Default for Sr-Ti/Fe-O/VO substitution system
     if atom_ind_group is None:
         atom_ind_group = [
-            [0],  # A-site: Sr
-            [1],  # B-site: Ti
-            [2]   # O-site: O
+            [0],      # A-site: Sr
+            [1, 2],   # B-site: Ti, Fe
+            [3, 4]    # O-site: O, VO
         ]
 
     if element_names is None:
-        element_names = ['Sr', 'Ti', 'O']
+        element_names = ['Sr', 'Ti', 'Fe', 'O', 'VO']
 
     calculator = EnergyCalculator(
         model_file=model_file,
