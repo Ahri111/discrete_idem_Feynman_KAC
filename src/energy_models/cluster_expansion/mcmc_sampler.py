@@ -50,14 +50,29 @@ class MCMCState:
 
 @dataclass
 class MCMCConfig:
-    """MCMC sampling configuration"""
+    """
+    MCMC sampling configuration
+
+    Args:
+        temperature: Temperature in Kelvin
+        n_equilibration: Number of equilibration steps
+        n_autocorr_measure: Steps for autocorrelation measurement
+        n_samples: Target number of independent samples
+        thinning: Thinning interval (None = auto-determine from tau)
+        swap_mode: Which sites to swap
+            'B-site': Only swap B-site pairs (e.g., Ti <-> Fe)
+            'O-site': Only swap O-site pairs (e.g., O <-> VO)
+            'both': Randomly choose B or O each step
+        save_interval: Progress print interval (steps)
+        seed: Random seed for reproducibility
+    """
     temperature: float = 300.0
     n_equilibration: int = 20000
     n_autocorr_measure: int = 5000
     n_samples: int = 1000
-    thinning: Optional[int] = None  # None = 'auto'
-    swap_mode: str = 'B-site'  # 'B-site', 'O-site', 'both'
-    save_interval: int = 100  # Save diagnostics every N steps
+    thinning: Optional[int] = None
+    swap_mode: str = 'B-site'
+    save_interval: int = 100
     seed: Optional[int] = None
 
 
@@ -126,15 +141,56 @@ class MCMCSampler:
         b_count = sum(self.composition.get('B', {}).values())
         o_count = sum(self.composition.get('O', {}).values())
 
-        # Atom ranges
+        # Total site ranges
         self.a_range = (0, a_count)
         self.b_range = (a_count, a_count + b_count)
         self.o_range = (a_count + b_count, a_count + b_count + o_count)
 
+        # Detailed ranges for each element type (for efficient swap)
+        # B-site element ranges
+        self.b_type_ranges = {}
+        current_idx = a_count
+        for elem, count in sorted(self.composition.get('B', {}).items()):
+            self.b_type_ranges[elem] = (current_idx, current_idx + count)
+            current_idx += count
+
+        # O-site element ranges
+        self.o_type_ranges = {}
+        current_idx = a_count + b_count
+        for elem, count in sorted(self.composition.get('O', {}).items()):
+            self.o_type_ranges[elem] = (current_idx, current_idx + count)
+            current_idx += count
+
         print(f"[MCMCSampler] Atom ranges:")
         print(f"  A-site: {self.a_range[0]}-{self.a_range[1]-1}")
         print(f"  B-site: {self.b_range[0]}-{self.b_range[1]-1}")
+        for elem, (start, end) in self.b_type_ranges.items():
+            print(f"    {elem}: {start}-{end-1}")
         print(f"  O-site: {self.o_range[0]}-{self.o_range[1]-1}")
+        for elem, (start, end) in self.o_type_ranges.items():
+            print(f"    {elem}: {start}-{end-1}")
+
+        # Setup swap pairs (different types only)
+        self.swap_pairs = []
+
+        # B-site pairs (e.g., Ti <-> Fe)
+        b_types = list(self.b_type_ranges.keys())
+        if len(b_types) >= 2:
+            # Always swap first two types (e.g., Ti <-> Fe)
+            self.swap_pairs.append(('B', b_types[0], b_types[1]))
+
+        # O-site pairs (e.g., O <-> VO)
+        o_types = list(self.o_type_ranges.keys())
+        if len(o_types) >= 2:
+            # Always swap first two types (e.g., O <-> VO)
+            self.swap_pairs.append(('O', o_types[0], o_types[1]))
+
+        if len(self.swap_pairs) == 0:
+            raise ValueError("No swap pairs available! Need at least 2 types in B-site or O-site")
+
+        print(f"[MCMCSampler] Swap pairs:")
+        for site, type1, type2 in self.swap_pairs:
+            print(f"  {site}-site: {type1} <-> {type2}")
 
 
     def initialize(self, initial_state=None):
@@ -171,34 +227,46 @@ class MCMCSampler:
 
     def metropolis_step(self) -> bool:
         """
-        Perform one Metropolis-Hastings step.
+        Perform one Metropolis-Hastings step with efficient swap.
+
+        Always swaps different types (e.g., Ti <-> Fe, O <-> VO) for efficiency.
+        Based on original algorithm but using incremental updates.
 
         Returns:
             accepted: Whether the move was accepted
         """
-        # Choose atoms to swap based on swap_mode
+        # Select swap pair based on mode
         if self.config.swap_mode == 'B-site':
-            idx1 = random.randint(self.b_range[0], self.b_range[1] - 1)
-            idx2 = random.randint(self.b_range[0], self.b_range[1] - 1)
+            # Only B-site pairs
+            available_pairs = [p for p in self.swap_pairs if p[0] == 'B']
         elif self.config.swap_mode == 'O-site':
-            idx1 = random.randint(self.o_range[0], self.o_range[1] - 1)
-            idx2 = random.randint(self.o_range[0], self.o_range[1] - 1)
+            # Only O-site pairs
+            available_pairs = [p for p in self.swap_pairs if p[0] == 'O']
         elif self.config.swap_mode == 'both':
-            # Randomly choose B or O
-            if random.random() < 0.5:
-                idx1 = random.randint(self.b_range[0], self.b_range[1] - 1)
-                idx2 = random.randint(self.b_range[0], self.b_range[1] - 1)
-            else:
-                idx1 = random.randint(self.o_range[0], self.o_range[1] - 1)
-                idx2 = random.randint(self.o_range[0], self.o_range[1] - 1)
+            # All pairs
+            available_pairs = self.swap_pairs
         else:
             raise ValueError(f"Unknown swap_mode: {self.config.swap_mode}")
 
-        # Skip if same atom
-        if idx1 == idx2:
+        if len(available_pairs) == 0:
             return False
 
-        # Swap atoms
+        # Randomly select one pair
+        site, type1, type2 = random.choice(available_pairs)
+
+        # Get ranges for each type
+        if site == 'B':
+            range1 = self.b_type_ranges[type1]
+            range2 = self.b_type_ranges[type2]
+        else:  # site == 'O'
+            range1 = self.o_type_ranges[type1]
+            range2 = self.o_type_ranges[type2]
+
+        # Select one atom from each type
+        idx1 = random.randint(range1[0], range1[1] - 1)
+        idx2 = random.randint(range2[0], range2[1] - 1)
+
+        # Swap atoms (ALWAYS different types)
         self.current_state['LattPnt'][idx1], self.current_state['LattPnt'][idx2] = \
             self.current_state['LattPnt'][idx2], self.current_state['LattPnt'][idx1]
 
