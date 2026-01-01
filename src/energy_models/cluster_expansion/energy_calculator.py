@@ -252,7 +252,8 @@ class EnergyCalculator:
         return positioned_neighbors
 
 
-    def _count_clusters_from_arrays(self, atom_types, positions_np, dismat):
+    def _count_clusters_from_arrays(self, atom_types, positions_np, dismat,
+                                     use_cache=False, structure_id=None):
         """
         Count clusters from numpy arrays (no POSCAR dict).
 
@@ -260,6 +261,8 @@ class EnergyCalculator:
             atom_types: [N] list/array of atom type indices
             positions_np: [N, 3] numpy array of fractional coordinates
             dismat: [N, N] numpy array of distances
+            use_cache: Use cached clusters if available
+            structure_id: Cache identifier (for diffusion denoising sequence)
 
         Returns:
             cluster_list: [B_count, O_count, cluster1_count, ..., clusterN_count]
@@ -273,19 +276,35 @@ class EnergyCalculator:
         # Initialize cluster counts
         cluster_counts = [0] * len(self.reference_clusters)
 
+        # Initialize cache if needed
+        if use_cache and structure_id:
+            if structure_id not in self._cluster_cache:
+                self._cluster_cache[structure_id] = {}
+            cluster_cache = self._cluster_cache[structure_id]
+        else:
+            cluster_cache = None
+
         # Count clusters at each B-site
         for b_idx in b_site_indices:
-            # Compute cluster
-            core_type = atom_types[b_idx]
-            positioned_neighbors = self._find_positioned_neighbors_numpy(
-                b_idx, positions_np, dismat, atom_types, self.atom_ind_group
-            )
-            cluster = generate_single_positioned_cluster(core_type, positioned_neighbors)
+            # Check cache
+            if cluster_cache is not None and b_idx in cluster_cache:
+                canonical = cluster_cache[b_idx]
+            else:
+                # Compute cluster
+                core_type = atom_types[b_idx]
+                positioned_neighbors = self._find_positioned_neighbors_numpy(
+                    b_idx, positions_np, dismat, atom_types, self.atom_ind_group
+                )
+                cluster = generate_single_positioned_cluster(core_type, positioned_neighbors)
 
-            if cluster is None:
-                continue
+                if cluster is None:
+                    continue
 
-            canonical = get_canonical_form(tuple(cluster))
+                canonical = get_canonical_form(tuple(cluster))
+
+                # Cache it
+                if cluster_cache is not None:
+                    cluster_cache[b_idx] = canonical
 
             # Lookup in reference (O(1))
             ref_idx = self.cluster_to_idx.get(canonical, None)
@@ -301,7 +320,8 @@ class EnergyCalculator:
         return result
 
 
-    def compute_energy_from_tensor(self, positions, atom_types, lattice, metadata=None):
+    def compute_energy_from_tensor(self, positions, atom_types, lattice, metadata=None,
+                                    use_cache=False, structure_id=None):
         """
         Compute energy from PyTorch tensors (for diffusion model).
 
@@ -313,6 +333,8 @@ class EnergyCalculator:
             atom_types: [N] tensor of type indices
             lattice: [3, 3] tensor of lattice vectors
             metadata: Optional metadata dict (unused but kept for compatibility)
+            use_cache: Use cached clusters (useful for diffusion denoising sequence)
+            structure_id: Cache identifier (e.g., 'diffusion_sample_0')
 
         Returns:
             energy: Predicted energy (float)
@@ -325,8 +347,11 @@ class EnergyCalculator:
         # Compute distance matrix
         dismat = self._compute_dismat_numpy(positions_np, lattice_np)
 
-        # Count clusters
-        cluster_list = self._count_clusters_from_arrays(atom_types_np, positions_np, dismat)
+        # Count clusters (with optional cache)
+        cluster_list = self._count_clusters_from_arrays(
+            atom_types_np, positions_np, dismat,
+            use_cache=use_cache, structure_id=structure_id
+        )
 
         # Scale and predict
         cluster_scaled = self.scaler.transform([cluster_list])[0]
