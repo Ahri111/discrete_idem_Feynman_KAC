@@ -36,7 +36,7 @@ def example_1_basic_tensor_conversion():
 
     # Create converter
     converter = StructureConverter(
-        element_names=['Sr', 'Ti', 'O'],
+        element_names=['Sr', 'Ti', 'Fe', 'O', 'VO'],
         template_file=poscar_file
     )
 
@@ -52,9 +52,10 @@ def example_1_basic_tensor_conversion():
     print(tensor_data['positions'][:5])
 
     print(f"\n  Atom type distribution:")
-    for i in range(3):
+    element_names = ['Sr', 'Ti', 'Fe', 'O', 'VO']
+    for i in range(5):
         count = (tensor_data['atom_types'] == i).sum().item()
-        print(f"    Type {i}: {count} atoms")
+        print(f"    Type {i} ({element_names[i]}): {count} atoms")
 
     # Convert back
     poscar_restored = converter.tensor_to_poscar(
@@ -82,8 +83,8 @@ def example_2_energy_from_tensor():
     # Create calculator with tensor support
     calculator = create_energy_calculator(
         base_dir=base_dir,
-        atom_ind_group=[[0], [1], [2]],  # Sr, Ti, O
-        element_names=['Sr', 'Ti', 'O']
+        atom_ind_group=[[0], [1, 2], [3, 4]],  # Sr, Ti/Fe, O/VO
+        element_names=['Sr', 'Ti', 'Fe', 'O', 'VO']
     )
 
     # Load and convert to tensor
@@ -123,8 +124,8 @@ def example_3_batch_tensor():
     # Create calculator
     calculator = create_energy_calculator(
         base_dir=base_dir,
-        atom_ind_group=[[0], [1], [2]],
-        element_names=['Sr', 'Ti', 'O']
+        atom_ind_group=[[0], [1, 2], [3, 4]],
+        element_names=['Sr', 'Ti', 'Fe', 'O', 'VO']
     )
 
     # Create batch of structures (copy same structure 8 times)
@@ -168,8 +169,8 @@ def example_4_diffusion_integration():
     # Initialize calculator (do this once)
     calculator = create_energy_calculator(
         base_dir=base_dir,
-        atom_ind_group=[[0], [1], [2]],
-        element_names=['Sr', 'Ti', 'O']
+        atom_ind_group=[[0], [1, 2], [3, 4]],
+        element_names=['Sr', 'Ti', 'Fe', 'O', 'VO']
     )
 
     print("\n[Simulating diffusion model workflow...]")
