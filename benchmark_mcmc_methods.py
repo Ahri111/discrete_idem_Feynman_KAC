@@ -45,7 +45,7 @@ def benchmark_old_method_simulation(calculator, initial_poscar, n_samples=10000,
         composition = {
             'A': {'Sr': 32},
             'B': {'Ti': 24, 'Fe': 8},
-            'O': {'O': 88, 'VO': 4}
+            'O': {'O': 92, 'VO': 4}
         }
 
         config = MCMCConfig(
@@ -132,7 +132,7 @@ def benchmark_new_method_no_cache(calculator, initial_poscar, n_samples=10000, t
     composition = {
         'A': {'Sr': 32},
         'B': {'Ti': 24, 'Fe': 8},
-        'O': {'O': 88, 'VO': 4}
+        'O': {'O': 92, 'VO': 4}
     }
 
     config = MCMCConfig(
@@ -196,7 +196,7 @@ def benchmark_new_method_with_cache(calculator, initial_poscar, n_samples=10000,
     composition = {
         'A': {'Sr': 32},
         'B': {'Ti': 24, 'Fe': 8},
-        'O': {'O': 88, 'VO': 4}
+        'O': {'O': 92, 'VO': 4}
     }
 
     config = MCMCConfig(
@@ -255,7 +255,7 @@ def main():
     print("\nConfiguration:")
     print("  - 10,000 samples")
     print("  - T = 500 K (reasonable acceptance rate)")
-    print("  - Sr-Ti0.75Fe0.25-O2.75VO0.25 composition")
+    print("  - Sr-Ti0.75Fe0.25-O2.875VO0.125 composition (ABO3: 32 Sr, 24 Ti, 8 Fe, 92 O, 4 VO)")
 
     # Setup
     base_dir = 'src/energy_models/cluster_expansion/energy_parameter'
