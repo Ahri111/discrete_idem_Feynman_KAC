@@ -1,54 +1,37 @@
 """
-Sublattice-Constrained Swap Diffusion Example
+Sublattice-Constrained Swap Diffusion (PyTorch GPU)
 
-Demonstrates:
-1. Parse POSCAR with sublattice structure
-2. Create batch of 16 structures
-3. Apply constrained swaps (Ti↔Fe on B-site, O↔VO on O-site)
-4. Visualize the swaps
+Fully parallelized batch processing for ABO3 perovskite structures.
+- B-site: Ti ↔ Fe only
+- O-site: O ↔ VO only
+- A-site (Sr): fixed
 """
 
 import torch
-import numpy as np
 import sys
 import os
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.energy_models.cluster_expansion.structure_utils import posreader
-
 
 # =============================================================================
-# POSCAR Parser for Sublattice Structure
+# POSCAR Parser
 # =============================================================================
 
 def parse_poscar_string(poscar_str: str) -> dict:
-    """Parse POSCAR string into structured dict with sublattice info"""
+    """Parse POSCAR string to dict"""
     lines = [l.strip() for l in poscar_str.strip().split('\n')]
 
-    # Parse header
     cell_name = lines[0]
     latt_const = float(lines[1])
-
-    # Lattice vectors
-    base = []
-    for i in range(2, 5):
-        base.append([float(x) for x in lines[i].split()])
-
-    # Element names and counts
+    base = [[float(x) for x in lines[i].split()] for i in range(2, 5)]
     ele_names = lines[5].split()
     atom_nums = [int(x) for x in lines[6].split()]
-    atom_sum = sum(atom_nums)
 
-    # Coordinate type
-    coord_type = lines[7]
-
-    # Positions
     positions = []
-    for i in range(8, 8 + atom_sum):
+    for i in range(8, 8 + sum(atom_nums)):
         parts = lines[i].split()
-        pos = [float(parts[0]), float(parts[1]), float(parts[2])]
-        positions.append(pos)
+        positions.append([float(parts[0]), float(parts[1]), float(parts[2])])
 
     return {
         'CellName': cell_name,
@@ -56,19 +39,18 @@ def parse_poscar_string(poscar_str: str) -> dict:
         'Base': base,
         'EleName': ele_names,
         'AtomNum': atom_nums,
-        'AtomSum': atom_sum,
-        'LatType': coord_type,
+        'AtomSum': sum(atom_nums),
         'LattPnt': positions
     }
 
 
 def poscar_to_tensors(poscar: dict, device='cpu') -> dict:
-    """Convert POSCAR dict to PyTorch tensors with sublattice masks"""
+    """Convert POSCAR to tensors with sublattice masks"""
 
     # Positions [N, 3]
     positions = torch.tensor(poscar['LattPnt'], dtype=torch.float32, device=device)
 
-    # Atom types [N] - expanded from counts
+    # Atom types [N]
     atom_types = []
     for type_idx, count in enumerate(poscar['AtomNum']):
         atom_types.extend([type_idx] * count)
@@ -77,22 +59,18 @@ def poscar_to_tensors(poscar: dict, device='cpu') -> dict:
     # Lattice [3, 3]
     lattice = torch.tensor(poscar['Base'], dtype=torch.float32, device=device)
 
-    # Build sublattice masks
-    # Sr=0 (A-site), Ti=1, Fe=2 (B-site), O=3, VO=4 (O-site)
+    # Type mapping: Sr=0, Ti=1, Fe=2, O=3, VO=4
     ele_names = poscar['EleName']
-
-    # Find type indices
     type_map = {name: idx for idx, name in enumerate(ele_names)}
 
-    a_site_mask = (atom_types == type_map.get('Sr', -1))
-    b_site_mask = (atom_types == type_map.get('Ti', -1)) | (atom_types == type_map.get('Fe', -1))
-    o_site_mask = (atom_types == type_map.get('O', -1)) | (atom_types == type_map.get('VO', -1))
+    # Sublattice masks
+    b_site_mask = (atom_types == type_map['Ti']) | (atom_types == type_map['Fe'])
+    o_site_mask = (atom_types == type_map['O']) | (atom_types == type_map['VO'])
 
     return {
         'positions': positions,
         'atom_types': atom_types,
         'lattice': lattice,
-        'a_site_mask': a_site_mask,
         'b_site_mask': b_site_mask,
         'o_site_mask': o_site_mask,
         'element_names': ele_names,
@@ -102,226 +80,185 @@ def poscar_to_tensors(poscar: dict, device='cpu') -> dict:
 
 
 # =============================================================================
-# GPU-Optimized Sublattice Swap
+# Parallel Swap Operations (from symdiff/utils.py pattern)
 # =============================================================================
 
 @torch.no_grad()
-def sample_sublattice_swap(
-    atom_types: torch.Tensor,      # [batch, N]
-    sublattice_mask: torch.Tensor, # [N] boolean
-    type_a: int,
-    type_b: int,
-    scores: torch.Tensor = None,   # [batch, N] optional, uniform if None
-    deterministic: bool = False
-) -> tuple:
+def swap_by_idx(x: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
     """
-    GPU-optimized sublattice-constrained swap
+    Swap elements at idx positions (fully parallel)
 
     Args:
-        atom_types: [batch, N] atom type indices
-        sublattice_mask: [N] mask for sublattice sites
-        type_a, type_b: types to swap (e.g., Ti=1, Fe=2)
-        scores: optional swap scores, uniform if None
-        deterministic: if True, pick highest score pairs
+        x: [batch, N] atom types
+        idx: [batch, 2] indices to swap
 
     Returns:
-        swapped_types: [batch, N]
-        swap_indices: [batch, 2] - indices that were swapped
+        x_swapped: [batch, N]
+    """
+    first = x.gather(-1, idx[..., 0:1])   # [batch, 1]
+    second = x.gather(-1, idx[..., 1:2])  # [batch, 1]
+
+    x_swapped = x.clone()
+    x_swapped.scatter_(-1, idx[..., 0:1], second)
+    x_swapped.scatter_(-1, idx[..., 1:2], first)
+
+    return x_swapped
+
+
+@torch.no_grad()
+def sample_sublattice_swap(
+    atom_types: torch.Tensor,       # [batch, N]
+    sublattice_mask: torch.Tensor,  # [N]
+    type_a: int,
+    type_b: int,
+    scores: torch.Tensor = None,    # [batch, N] or None
+) -> tuple:
+    """
+    GPU-parallel sublattice-constrained swap
+
+    Selects one atom of type_a and one of type_b within sublattice,
+    then swaps them. All batch elements processed in parallel.
+
+    Args:
+        atom_types: [batch, N] current atom type indices
+        sublattice_mask: [N] boolean mask for sublattice
+        type_a, type_b: types to swap (e.g., Ti=1, Fe=2)
+        scores: [batch, N] swap scores (None = uniform random)
+
+    Returns:
+        swapped: [batch, N] atom types after swap
+        indices: [batch, 2] swapped positions
     """
     device = atom_types.device
     batch_size, N = atom_types.shape
 
-    # Get sublattice indices
-    sub_indices = torch.where(sublattice_mask)[0]  # [M]
-    M = len(sub_indices)
+    # 1. Get sublattice indices
+    sub_idx = torch.where(sublattice_mask)[0]  # [M]
+    M = len(sub_idx)
 
-    # Extract sublattice atom types
-    sub_types = atom_types[:, sub_indices]  # [batch, M]
+    # 2. Extract sublattice
+    sub_types = atom_types[:, sub_idx]  # [batch, M]
 
-    # Find type_a and type_b positions within sublattice
-    is_type_a = (sub_types == type_a)  # [batch, M]
-    is_type_b = (sub_types == type_b)  # [batch, M]
+    # 3. Type masks
+    is_a = (sub_types == type_a)  # [batch, M]
+    is_b = (sub_types == type_b)  # [batch, M]
 
-    # Create scores if not provided (uniform)
+    # 4. Scores (uniform if not provided)
     if scores is None:
-        scores = torch.zeros(batch_size, M, device=device)
+        sub_scores = torch.zeros(batch_size, M, device=device)
     else:
-        scores = scores[:, sub_indices]  # [batch, M]
+        sub_scores = scores[:, sub_idx]
 
-    # Mask scores for each type
-    score_a = scores.masked_fill(~is_type_a, float('-inf'))
-    score_b = scores.masked_fill(~is_type_b, float('-inf'))
+    # 5. Gumbel noise for stochastic sampling
+    noise = torch.rand(batch_size, M, device=device).clamp(min=1e-10)
+    gumbel = -torch.log(-torch.log(noise))
 
-    # Gumbel sampling
-    if not deterministic:
-        noise_a = torch.rand_like(score_a)
-        noise_a = torch.clamp(noise_a, min=1e-10)
-        gumbel_a = -torch.log(-torch.log(noise_a))
+    # 6. Masked scores (type_a positions only, type_b positions only)
+    score_a = sub_scores + gumbel
+    score_b = sub_scores + gumbel
+    score_a = score_a.masked_fill(~is_a, float('-inf'))
+    score_b = score_b.masked_fill(~is_b, float('-inf'))
 
-        noise_b = torch.rand_like(score_b)
-        noise_b = torch.clamp(noise_b, min=1e-10)
-        gumbel_b = -torch.log(-torch.log(noise_b))
+    # 7. Select one from each type (parallel across batch)
+    local_a = torch.argmax(score_a, dim=-1)  # [batch]
+    local_b = torch.argmax(score_b, dim=-1)  # [batch]
 
-        score_a = score_a + gumbel_a
-        score_b = score_b + gumbel_b
+    # 8. Map to global indices
+    global_a = sub_idx[local_a]  # [batch]
+    global_b = sub_idx[local_b]  # [batch]
 
-    # Select one from each type
-    local_idx_a = torch.argmax(score_a, dim=-1)  # [batch]
-    local_idx_b = torch.argmax(score_b, dim=-1)  # [batch]
+    # 9. Stack indices and swap
+    indices = torch.stack([global_a, global_b], dim=-1)  # [batch, 2]
+    swapped = swap_by_idx(atom_types, indices)
 
-    # Map to global indices
-    global_idx_a = sub_indices[local_idx_a]  # [batch]
-    global_idx_b = sub_indices[local_idx_b]  # [batch]
-
-    # Perform swap
-    swapped_types = atom_types.clone()
-    batch_idx = torch.arange(batch_size, device=device)
-    swapped_types[batch_idx, global_idx_a] = type_b
-    swapped_types[batch_idx, global_idx_b] = type_a
-
-    swap_indices = torch.stack([global_idx_a, global_idx_b], dim=-1)  # [batch, 2]
-
-    return swapped_types, swap_indices
+    return swapped, indices
 
 
-def apply_random_swaps(
-    atom_types: torch.Tensor,
-    b_site_mask: torch.Tensor,
-    o_site_mask: torch.Tensor,
+@torch.no_grad()
+def apply_n_swaps(
+    atom_types: torch.Tensor,       # [batch, N]
+    b_site_mask: torch.Tensor,      # [N]
+    o_site_mask: torch.Tensor,      # [N]
     type_map: dict,
-    n_swaps: int = 10,
+    n_swaps: int,
     swap_mode: str = 'both'
 ) -> tuple:
     """
-    Apply multiple random swaps to create noisy configurations
+    Apply n swap steps (batch parallel at each step)
 
     Args:
         atom_types: [batch, N]
         b_site_mask, o_site_mask: sublattice masks
-        type_map: element name to type index mapping
+        type_map: element name -> type index
         n_swaps: number of swap steps
         swap_mode: 'B-site', 'O-site', or 'both'
 
     Returns:
-        noisy_types: [batch, N]
-        swap_history: list of swap indices
+        final: [batch, N] after all swaps
+        history: list of (sublattice, indices) tuples
     """
     current = atom_types.clone()
-    swap_history = []
+    history = []
 
-    ti_type = type_map.get('Ti', 1)
-    fe_type = type_map.get('Fe', 2)
-    o_type = type_map.get('O', 3)
-    vo_type = type_map.get('VO', 4)
+    ti, fe = type_map['Ti'], type_map['Fe']
+    o, vo = type_map['O'], type_map['VO']
 
     for step in range(n_swaps):
         # Choose sublattice
         if swap_mode == 'B-site':
-            do_b_site = True
+            do_b = True
         elif swap_mode == 'O-site':
-            do_b_site = False
-        else:  # 'both'
-            do_b_site = (torch.rand(1).item() < 0.5)
-
-        if do_b_site:
-            current, indices = sample_sublattice_swap(
-                current, b_site_mask, ti_type, fe_type
-            )
+            do_b = False
         else:
-            current, indices = sample_sublattice_swap(
-                current, o_site_mask, o_type, vo_type
-            )
+            do_b = torch.rand(1).item() < 0.5
 
-        swap_history.append(('B' if do_b_site else 'O', indices))
+        # Apply swap (entire batch in parallel)
+        if do_b:
+            current, idx = sample_sublattice_swap(current, b_site_mask, ti, fe)
+            history.append(('B', idx.clone()))
+        else:
+            current, idx = sample_sublattice_swap(current, o_site_mask, o, vo)
+            history.append(('O', idx.clone()))
 
-    return current, swap_history
+    return current, history
 
 
 # =============================================================================
 # Visualization
 # =============================================================================
 
-def visualize_atom_types(atom_types: torch.Tensor, element_names: list, atom_counts: list):
-    """Print atom type distribution for each batch"""
+def print_composition(atom_types: torch.Tensor, element_names: list):
+    """Print composition for all batches"""
     batch_size = atom_types.shape[0]
 
-    print("\n" + "="*70)
-    print("Atom Type Distribution (after swaps)")
-    print("="*70)
+    print(f"\n{'Batch':>5} | " + " | ".join(f"{n:>3}" for n in element_names))
+    print("-" * 50)
 
     for b in range(batch_size):
-        types_b = atom_types[b].cpu().numpy()
-
-        # Count each type
-        counts = {}
-        for t, name in enumerate(element_names):
-            counts[name] = (types_b == t).sum()
-
-        print(f"\nBatch {b:2d}: ", end="")
-        for name in element_names:
-            print(f"{name}={counts[name]:2d}  ", end="")
-
-        # Check composition preserved
-        original_counts = {name: c for name, c in zip(element_names, atom_counts)}
-        if all(counts[n] == original_counts[n] for n in element_names):
-            print("✓ composition preserved")
-        else:
-            print("✗ COMPOSITION ERROR!")
+        counts = [(atom_types[b] == t).sum().item() for t in range(len(element_names))]
+        print(f"{b:>5} | " + " | ".join(f"{c:>3}" for c in counts))
 
 
-def visualize_swaps(swap_history: list, batch_idx: int = 0):
-    """Show swap history for one batch element"""
-    print(f"\n--- Swap History (batch {batch_idx}) ---")
-    for i, (site, indices) in enumerate(swap_history):
-        idx_a = indices[batch_idx, 0].item()
-        idx_b = indices[batch_idx, 1].item()
-        print(f"  Step {i+1}: {site}-site swap at indices ({idx_a}, {idx_b})")
+def print_sublattice(atom_types: torch.Tensor, mask: torch.Tensor, type_map: dict,
+                     name: str, type_names: tuple, batch_idx: int = 0):
+    """Print sublattice configuration"""
+    sub_idx = torch.where(mask)[0]
+    sub_types = atom_types[batch_idx, sub_idx].cpu()
 
+    symbols = [type_names[0] if t == type_map[type_names[0]] else type_names[1]
+               for t in sub_types.tolist()]
 
-def visualize_sublattice_state(
-    atom_types: torch.Tensor,
-    b_site_mask: torch.Tensor,
-    o_site_mask: torch.Tensor,
-    type_map: dict,
-    batch_idx: int = 0
-):
-    """Show detailed sublattice configuration"""
-    types = atom_types[batch_idx].cpu()
-
-    # B-site configuration
-    b_indices = torch.where(b_site_mask)[0]
-    b_types = types[b_indices]
-    ti_count = (b_types == type_map['Ti']).sum().item()
-    fe_count = (b_types == type_map['Fe']).sum().item()
-
-    # O-site configuration
-    o_indices = torch.where(o_site_mask)[0]
-    o_types = types[o_indices]
-    o_count = (o_types == type_map['O']).sum().item()
-    vo_count = (o_types == type_map['VO']).sum().item()
-
-    print(f"\n--- Sublattice State (batch {batch_idx}) ---")
-    print(f"  B-site ({len(b_indices)} sites): Ti={ti_count}, Fe={fe_count}")
-    print(f"  O-site ({len(o_indices)} sites): O={o_count}, VO={vo_count}")
-
-    # Show B-site pattern (first 16)
-    print(f"\n  B-site pattern (first 16 sites):")
-    print("  ", end="")
-    for i, idx in enumerate(b_indices[:16]):
-        t = types[idx].item()
-        symbol = 'Ti' if t == type_map['Ti'] else 'Fe'
-        print(f"{symbol:2s} ", end="")
-        if (i + 1) % 8 == 0:
-            print("\n  ", end="")
+    print(f"\n  {name} ({len(sub_idx)} sites):")
+    for i in range(0, len(symbols), 8):
+        row = symbols[i:i+8]
+        print(f"    {i:>2}-{i+len(row)-1:>2}: " + " ".join(f"{s:>2}" for s in row))
 
 
 # =============================================================================
-# Main Demo
+# Main
 # =============================================================================
 
-def main():
-    # Sample POSCAR from user input
-    poscar_str = """SrTiFeO
+POSCAR_STR = """SrTiFeO
 1.000000
 11.199000 0.000000 0.000000
 0.000000 11.199000 0.000000
@@ -490,106 +427,80 @@ Direct
 0.609000 0.641000 0.250000
 0.859000 0.609000 0.250000"""
 
-    print("="*70)
-    print("Sublattice-Constrained Swap Diffusion Demo")
-    print("="*70)
 
-    # 1. Parse POSCAR
+def main():
+    torch.manual_seed(42)
+
+    print("=" * 60)
+    print("Sublattice-Constrained Swap Diffusion (PyTorch)")
+    print("=" * 60)
+
+    # 1. Parse & convert
     print("\n[1] Parsing POSCAR...")
-    poscar = parse_poscar_string(poscar_str)
+    poscar = parse_poscar_string(POSCAR_STR)
     print(f"    Elements: {poscar['EleName']}")
     print(f"    Counts:   {poscar['AtomNum']}")
-    print(f"    Total:    {poscar['AtomSum']} atoms")
 
-    # 2. Convert to tensors
-    print("\n[2] Converting to tensors...")
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"    Device: {device}")
-
+    print(f"\n[2] Converting to tensors (device: {device})...")
     data = poscar_to_tensors(poscar, device=device)
-    print(f"    Positions shape: {data['positions'].shape}")
-    print(f"    Atom types shape: {data['atom_types'].shape}")
-    print(f"    B-site atoms: {data['b_site_mask'].sum().item()}")
-    print(f"    O-site atoms: {data['o_site_mask'].sum().item()}")
+    print(f"    Shape: {data['atom_types'].shape}")
+    print(f"    B-site: {data['b_site_mask'].sum().item()} atoms (Ti+Fe)")
+    print(f"    O-site: {data['o_site_mask'].sum().item()} atoms (O+VO)")
 
-    # 3. Create batch of 16
-    print("\n[3] Creating batch of 16 structures...")
+    # 2. Create batch
     batch_size = 16
-    atom_types_batch = data['atom_types'].unsqueeze(0).expand(batch_size, -1).clone()
-    print(f"    Batch shape: {atom_types_batch.shape}")
+    print(f"\n[3] Creating batch of {batch_size}...")
+    x = data['atom_types'].unsqueeze(0).expand(batch_size, -1).clone()
+    print(f"    Batch shape: {x.shape}")
 
-    # 4. Apply random swaps (different amounts per batch)
-    print("\n[4] Applying random swaps...")
+    # 3. Show original
+    print("\n[4] Original B-site configuration (batch 0):")
+    print_sublattice(x, data['b_site_mask'], data['type_map'],
+                     "B-site", ('Ti', 'Fe'), batch_idx=0)
 
-    # Different noise levels for different batches
-    noisy_batch = atom_types_batch.clone()
-    all_swap_history = []
+    # 4. Apply swaps (PARALLEL across batch)
+    n_swaps = 20
+    print(f"\n[5] Applying {n_swaps} swaps (batch-parallel)...")
 
-    for b in range(batch_size):
-        n_swaps = (b + 1) * 2  # 2, 4, 6, ..., 32 swaps
-        single = atom_types_batch[b:b+1]
-
-        noisy, history = apply_random_swaps(
-            single,
-            data['b_site_mask'],
-            data['o_site_mask'],
-            data['type_map'],
-            n_swaps=n_swaps,
-            swap_mode='both'
-        )
-        noisy_batch[b] = noisy[0]
-        all_swap_history.append((n_swaps, history))
-
-    print(f"    Applied 2 to 32 swaps per structure")
-
-    # 5. Visualize results
-    visualize_atom_types(
-        noisy_batch,
-        data['element_names'],
-        data['atom_counts']
+    x_noisy, history = apply_n_swaps(
+        x,
+        data['b_site_mask'],
+        data['o_site_mask'],
+        data['type_map'],
+        n_swaps=n_swaps,
+        swap_mode='both'
     )
 
-    # Show detailed view for a few examples
+    # Show swap history (first 5 steps)
+    print("\n    Swap history (first 5 steps):")
+    for i, (site, idx) in enumerate(history[:5]):
+        # idx is [batch, 2], show for batch 0
+        a, b = idx[0].tolist()
+        print(f"      Step {i+1}: {site}-site swap ({a}, {b})")
+    print(f"      ... and {n_swaps - 5} more")
+
+    # 5. Show results
+    print("\n[6] After swaps - B-site configuration:")
     for b in [0, 7, 15]:
-        n_swaps, history = all_swap_history[b]
-        print(f"\n{'='*70}")
-        print(f"Detailed view: Batch {b} ({n_swaps} swaps)")
-        print("="*70)
-        visualize_sublattice_state(
-            noisy_batch,
-            data['b_site_mask'],
-            data['o_site_mask'],
-            data['type_map'],
-            batch_idx=b
-        )
-        if n_swaps <= 10:
-            visualize_swaps(history, batch_idx=0)
+        print(f"\n    Batch {b}:")
+        print_sublattice(x_noisy, data['b_site_mask'], data['type_map'],
+                         "B-site", ('Ti', 'Fe'), batch_idx=b)
 
-    # 6. Verify composition preservation
-    print("\n" + "="*70)
-    print("Composition Verification")
-    print("="*70)
+    # 6. Verify composition
+    print("\n[7] Composition check:")
+    print_composition(x_noisy, data['element_names'])
 
-    original_counts = torch.tensor(data['atom_counts'], device=device)
-    all_correct = True
+    original = torch.tensor(data['atom_counts'], device=device)
+    all_ok = all(
+        all((x_noisy[b] == t).sum() == original[t] for t in range(len(original)))
+        for b in range(batch_size)
+    )
+    print(f"\n    Composition preserved: {'✓' if all_ok else '✗'}")
 
-    for b in range(batch_size):
-        types_b = noisy_batch[b]
-        counts_b = torch.tensor([
-            (types_b == t).sum().item()
-            for t in range(len(data['element_names']))
-        ], device=device)
-
-        if not torch.equal(counts_b, original_counts):
-            print(f"  Batch {b}: FAILED - {counts_b.tolist()} vs {original_counts.tolist()}")
-            all_correct = False
-
-    if all_correct:
-        print("  ✓ All 16 structures have correct composition!")
-
-    print("\n" + "="*70)
-    print("Demo complete!")
-    print("="*70)
+    print("\n" + "=" * 60)
+    print("Done!")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
